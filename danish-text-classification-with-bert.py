@@ -1,0 +1,216 @@
+import os
+import json
+import numpy as np
+np.set_printoptions(suppress=True) 
+import matplotlib.pyplot as plt
+import matplotlib
+import collections
+import pandas as pd
+import tensorflow as tf
+import tensorflow_hub as hub
+from datetime import datetime
+!pip install bert-tensorflow
+import bert
+#from bert import run_classifier
+from bert import optimization
+from bert import tokenization
+#from bert import modeling
+
+# pip install transformers
+
+# Huggingface transformers dependencies
+import transformers
+from transformers import TFBertModel,  BertConfig, BertTokenizerFast
+
+# Keras dependencies
+from tensorflow.keras.layers import Input, Dropout, Dense
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.initializers import TruncatedNormal
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.metrics import CategoricalAccuracy
+from tensorflow.keras.utils import to_categorical
+from keras.callbacks import EarlyStopping
+from keras.callbacks import ModelCheckpoint
+from keras.models import load_model
+
+# sklearn dependencies
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, accuracy_score
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+
+# Read .CSV dataset
+ds_covid = 'path/to/data_covid19/danish.csv'
+df_covid = pd.read_csv(ds_covid)
+df_covid.columns = ['Language', 'Domain', 'Intent', 'Industry', 'Text', 'Want To']
+data = df_covid[['Domain', 'Intent', 'Text']]
+
+# Filtering rows
+data = data.groupby('Text').filter(lambda x : len(x) < 3) # drops comments with less than 3 characters
+
+# Categorize fine-tuning data labels
+data['Domain_label'] = pd.Categorical(data['Domain'])
+data['Intent_label'] = pd.Categorical(data['Intent'])
+
+# Transforms labels to numerical values
+data['Domain'] = data['Domain_label'].cat.codes
+data['Intent'] = data['Intent_label'].cat.codes
+data.Domain.value_counts()
+data.Intent.value_counts()
+
+# Save copy of entire dataset
+entire_dataset = data.copy() 
+
+# Split data into fine-tuning and test samples
+data, data_test = train_test_split(data, test_size = 0.2, stratify = data[['Intent']], random_state=123)
+print('Train data shapes:', data.shape)
+print('Test data shapes:', data_test.shape)
+
+
+
+# Load pre-trained Danish BERT model from BotXO and build multiclass classification model with Keras
+folder_bert = '/path/to/bert-base-danish'
+
+# Fine-tune different versions of model on different number of epochs
+epochs = [5,10,15,20,25,30]
+
+# Create an empty test results dataframe
+results = pd.DataFrame(index=range(len(epochs)), columns=['Epochs','Domain (F1)', 'Domain (acc)','Intent (F1)', 'Intent (acc)'])
+results['Epochs'] = epochs
+
+for i, epchs in enumerate(epochs):
+
+  # Config loaded with output_hidden_states set to False
+  config = BertConfig.from_pretrained(folder_bert + '/bert_config.json')
+  config.output_hidden_states = False
+  print('1. BERT Config loaded.')
+
+  # BERT tokenizer loaded
+  tokenizer = BertTokenizerFast.from_pretrained(pretrained_model_name_or_path = folder_bert, config = config)
+  print('2. BERT Tokenizer loaded.')
+  # Transformers BERT model loaded
+  tf_BERT_model = TFBertModel.from_pretrained(folder_bert, from_pt=True, config = config)
+  print('3. BERT Model loaded.')
+
+  # Max token length
+  max_length = 100
+
+  # The MainLayer of BERT is loaded
+  BERT = tf_BERT_model.layers[0]
+
+  # Construct model inputs, attention masking is included
+  input_ids = Input(shape=(max_length,), name='input_ids', dtype='int32')
+  attention_mask = Input(shape=(max_length,), name='attention_mask', dtype='int32') 
+  inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
+  #inputs = {'input_ids': input_ids}
+
+  # The BERT model is loaded as a single layer into the Keras modelling
+  BERT_model = BERT(inputs)[1]
+  dropout = Dropout(config.hidden_dropout_prob, name='pooledOutput')
+  pooledOutput = dropout(BERT_model, training=False)
+
+  # Predictive outputs for the 'Domain' and 'Intent' labels of the COVID-19 dataset are constructed
+  domain = Dense(units=len(data.Domain_label.value_counts()), kernel_initializer=TruncatedNormal(stddev=config.initializer_range), name='domain')(pooledOutput)
+  intent = Dense(units=len(data.Intent_label.value_counts()), kernel_initializer=TruncatedNormal(stddev=config.initializer_range), name='intent')(pooledOutput)
+  outputs = {'domain': domain, 'intent': intent}
+
+  # The above is put into the Model() function to create a Keras model object 
+  model = Model(inputs=inputs, outputs=outputs, name='Danish_BERT_MultiClass_Model')
+  #model.summary()
+
+  # Model fine-tuning:
+  # Adam optimization algorithm with gradient clipping
+  opt = Adam(learning_rate=5e-05,epsilon=1e-08,decay=0.01,clipnorm=1.0)
+
+  # Use categorical losses and metrics
+  loss = {'domain': CategoricalCrossentropy(from_logits = True), 'intent': CategoricalCrossentropy(from_logits = True)}
+  metric = {'domain': CategoricalAccuracy('accuracy'), 'intent': CategoricalAccuracy('accuracy')}
+
+  # Tested some countermeasures for overfitting
+  #es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=3)
+  #mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', save_best_only=True)
+
+  # Compiling
+  model.compile(optimizer = opt, loss = loss, metrics = metric)
+
+  # Preprocess labels into categories
+  y_domain = to_categorical(data['Domain'])
+  y_intent = to_categorical(data['Intent'])
+
+  # Apply tokenizer to text/question inputs from users in the dataset
+  x = tokenizer(
+      text=data['Text'].to_list(),
+      add_special_tokens=True,
+      max_length=max_length,
+      truncation=True,
+      padding='max_length', # Instead of equal to True, the input sequences are padded all the way up to max_length such that all inputs are of the same length
+      return_tensors='tf',
+      return_token_type_ids = False,
+      return_attention_mask = True, 
+      verbose = True)
+
+  # Model is fit to the fine-tuning data with a small validation split
+  history = model.fit(
+      x={'input_ids': x['input_ids'], 'attention_mask': x['attention_mask']},
+      #x={'input_ids': x['input_ids']},
+      y={'domain': y_domain, 'intent': y_intent},
+      validation_split=0.2,
+      batch_size=32, # 64 gives OOM errors
+      epochs=epchs) # Loops over different number of epochs
+      #callbacks=[es,mc])
+  model.save('/path/to/models/model_'+str(epchs)+'_epchs')
+
+  # Preprocess the test data labels into categorical
+  test_y_domain = to_categorical(data_test['Domain'])
+  test_y_intent = to_categorical(data_test['Intent'])
+
+  test_x = tokenizer(
+      text=data_test['Text'].to_list(),
+      add_special_tokens=True,
+      max_length=max_length,
+      truncation=True,
+      padding='max_length',
+      return_tensors='tf',
+      return_token_type_ids = False,
+      return_attention_mask = True,
+      verbose = True)
+
+  '''
+  model_evaluation = model.evaluate(
+      #x={'input_ids': test_x['input_ids']},
+      x={'input_ids': test_x['input_ids'], 'attention_mask': test_x['attention_mask']},
+      y={'issue': test_y_domain, 'product': test_y_intent}
+  )
+  '''
+
+  # Predictions & model evaluation
+  preds = model.predict( x={'input_ids': test_x['input_ids'], 'attention_mask': test_x['attention_mask']}) 
+
+  # Taking argmax to set highest value category equal to 1, rest equal to 0.
+  predsDomain = np.zeros_like(preds['domain'])
+  predsDomain[np.arange(len(preds['domain'])), preds['domain'].argmax(1)] = 1 #argmax of highest value at set that value equal to 1, the rest of the classes are 0
+  predsIntent = np.zeros_like(preds['intent'])
+  predsIntent[np.arange(len(preds['intent'])), preds['intent'].argmax(1)] = 1
+
+  # Evaluation scores
+  print('F1 Score of Domain:', round(f1_score(test_y_domain, predsDomain, average='weighted'),3))
+  print('Accuracy Score of Domain: ', round(accuracy_score(test_y_domain, predsDomain),3))
+  print('F1 Score of Intent:', round(f1_score(test_y_intent, predsIntent, average='weighted'),3))
+  print('Accuracy Score of Intent: ', round(accuracy_score(test_y_intent, predsIntent),3))
+
+  # Test data results tabel
+  results = pd.read_csv('path/to/results.csv') # Read current results table
+  results['Domain (F1)'].loc[i] = round(f1_score(test_y_domain, predsDomain, average='weighted'),3)
+  results['Domain (acc)'].loc[i] = round(accuracy_score(test_y_domain, predsDomain),3)
+  results['Intent (F1)'].loc[i] = round(f1_score(test_y_intent, predsIntent, average='weighted'),3)
+  results['Intent (acc)'].loc[i] = round(accuracy_score(test_y_intent, predsIntent),3) 
+  results.to_csv('path/to/results.csv',index=False)
+  results.to_latex('path/toresults.tex',index=False)
+
+# Save fine-tuning history of model_30_epochs
+json.dump(history.history, open('path/to/model_30_epochs_history.json', 'w'))
