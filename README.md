@@ -1,4 +1,4 @@
-# Danish-text-classification-with-BERT
+# Danish Text Classification with BERT
 Text classification of actual multi-label and multi-class [covid-19 questions in Danish labeled by BotXO](https://github.com/certainlyio/corona_dataset).
 
 ## Loading COVID-19 dataset
